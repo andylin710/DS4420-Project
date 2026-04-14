@@ -1,0 +1,281 @@
+---
+title: "DS4420 Project: Predicting Gold Prices with Machine Learning Models"
+authors: "Justin Wee & Andy Lin"
+output: html_notebook
+---
+
+ARIMA(3,1,3) on Gold Price (USD)
+
+```{r}
+library(zoo)
+library(ggplot2)
+set.seed(42)
+
+# Load and clean data
+gold_raw <- read.csv("gold.csv", stringsAsFactors = FALSE,
+                     na.strings = "#N/A", check.names = FALSE)
+
+# Strip BOM from first column name if present
+colnames(gold_raw)[1] <- gsub("\xef\xbb\xbf|\\?", "", colnames(gold_raw)[1])
+colnames(gold_raw)[1] <- "Date"
+
+# Clean USD column: remove commas, convert to numeric
+gold_raw$USD <- as.numeric(gsub(",", "", gold_raw$USD))
+
+# Parse dates and sort
+gold_raw$Date <- as.Date(gold_raw$Date, format = "%m/%d/%y")
+gold_raw <- gold_raw[order(gold_raw$Date), ]
+
+# Drop rows with missing USD and filter to 2018 and later
+gold_clean <- gold_raw[!is.na(gold_raw$USD), c("Date", "USD")]
+gold_clean <- gold_clean[gold_clean$Date >= as.Date("2018-01-01"), ]
+
+cat("Rows after cleaning:", nrow(gold_clean), "\n")
+cat("Date range:", format(min(gold_clean$Date)), "to", format(max(gold_clean$Date)), "\n")
+
+head(gold_clean)
+```
+
+```{r}
+# Visualize the raw gold price data
+ggplot(gold_clean, aes(x = Date, y = USD)) +
+  geom_line() +
+  ggtitle("Gold Price (USD) Over Time") +
+  xlab("Date") + ylab("Price (USD/oz)") 
+```
+
+```{r}
+# Create lag features (up to lag 8)
+gold_lags <- gold_clean
+for (i in 1:8) {
+  gold_lags[, paste0("Lag_", i)] <- c(rep(NA, i), head(gold_lags$USD, -i))
+}
+
+# Drop rows with NAs introduced by lagging
+gold_lags <- na.omit(gold_lags)
+
+# ACF on the USD series to analyze autocorrelation structure
+acf(gold_lags$USD, main = "Gold Price (USD) ACF Plot")
+```
+
+```{r}
+# Train/Test Split (80/20)
+train_size <- round(0.8 * nrow(gold_lags))
+train_data <- gold_lags[1:train_size, ]
+test_data <- gold_lags[(train_size + 1):nrow(gold_lags), ]
+
+y_train <- train_data$USD
+y_test <- test_data$USD
+
+cat("Training size:", nrow(train_data), "\n")
+cat("Test size:", nrow(test_data), "\n")
+```
+
+```{r}
+# Manual Differencing (d = 1)
+difference <- function(x, d = 1) {
+  for (i in seq_len(d)) x <- diff(x)
+  return(x)
+}
+
+train_diff <- difference(y_train, d = 1)
+
+# ACF on differenced series to justify p and q choices
+acf(train_diff, lag.max = 20, main = "ACF of Differenced Gold Price (USD)")
+```
+
+```{r}
+# Manual ARIMA(3,1,3) via Gradient Descent
+fit_arima_manual <- function(x_diff, p = 3, q = 3, n_iter = 500, lr = 1e-6) {
+  n <- length(x_diff)
+  start <- max(p, q) + 1
+  y <- x_diff[start:n]
+  N <- length(y)
+
+  # Initialize coefficients
+  phi <- rep(0.01, p) 
+  theta <- rep(0.01, q) 
+  mu <- mean(y)
+
+  errors <- rep(0, n) 
+
+  for (iter in 1:n_iter) {
+    resid <- numeric(N)
+
+    for (t in 1:N) {
+      t_orig <- t + start - 1
+
+      ar_idx <- (t_orig - 1):(t_orig - p)
+      ma_idx <- (t_orig - 1):(t_orig - q)
+
+      ar_part <- sum(phi * x_diff[ar_idx])
+      ma_part <- sum(theta * errors[ma_idx])
+
+      fitted <- mu + ar_part + ma_part
+      resid[t] <- y[t] - fitted
+      errors[t_orig] <- resid[t]
+    }
+
+    # Gradients (MSE loss)
+    grad_mu <- -2 * mean(resid)
+
+    grad_phi <- numeric(p)
+    for (j in 1:p) {
+      lag_vals <- x_diff[(start - j):(n - j)]
+      grad_phi[j] <- -2 * mean(resid * lag_vals)
+    }
+
+    grad_theta <- numeric(q)
+    for (j in 1:q) {
+      err_vals <- errors[(start - j):(n - j)]
+      grad_theta[j] <- -2 * mean(resid * err_vals)
+    }
+
+    # Gradient descent update
+    mu <- mu - lr * grad_mu
+    phi <- phi - lr * grad_phi
+    theta <- theta - lr * grad_theta
+
+    if (iter %% 100 == 0) {
+      cat(sprintf("Iter %d | MSE: %.4f\n", iter, mean(resid^2)))
+    }
+  }
+
+  list(phi = phi, theta = theta, mu = mu,
+       residuals = resid, errors = errors)
+}
+
+cat("\nFitting manual ARIMA(3,1,3)...\n")
+fit <- fit_arima_manual(train_diff, p = 3, q = 3, n_iter = 500, lr = 1e-6)
+
+cat("\nEstimated AR coefficients (phi):\n"); print(round(fit$phi, 4))
+cat("Estimated MA coefficients (theta):\n"); print(round(fit$theta, 4))
+cat("Estimated intercept (mu):\n"); print(round(fit$mu, 4))
+```
+
+```{r}
+# Stationarity Check - AR root moduli should all be > 1
+ar_roots <- polyroot(c(1, -fit$phi))
+cat("\nAR Root Moduli (should all be > 1 for stationarity):\n")
+print(round(Mod(ar_roots), 4))
+```
+
+```{r}
+# Forecast
+forecast_arima <- function(x_orig, fit, p = 3, q = 3, h) {
+  x_diff <- difference(x_orig, d = 1)
+  n <- length(x_diff)
+  past_errors <- fit$errors
+
+  extended <- c(x_diff, rep(NA, h))
+  extended_errors <- c(past_errors, rep(0, h))
+
+  for (i in 1:h) {
+    t <- n + i
+    ar_idx <- (t - 1):(t - p)
+    ma_idx <- (t - 1):(t - q)
+
+    ar_part <- sum(fit$phi * extended[ar_idx])
+    ma_part <- sum(fit$theta * extended_errors[ma_idx])
+    extended[t] <- fit$mu + ar_part + ma_part
+  }
+
+  # Invert differencing to return to original scale
+  last_val <- tail(x_orig, 1)
+  diff_fcst <- tail(extended, h)
+  cumsum(c(last_val, diff_fcst))[-1]
+}
+
+h_steps <- nrow(test_data)
+forecasts <- forecast_arima(y_train, fit, p = 3, q = 3, h = h_steps)
+```
+
+```{r}
+# Evaluation
+mae <- mean(abs(forecasts - y_test))
+rmse <- sqrt(mean((forecasts - y_test)^2))
+mape <- mean(abs((forecasts - y_test) / y_test)) * 100
+
+cat(sprintf("Forecast Evaluation (last %d months):\n", h_steps))
+cat(sprintf("MAE:  %.2f\n", mae))
+cat(sprintf("RMSE: %.2f\n", rmse))
+cat(sprintf("MAPE: %.2f%%\n", mape))
+```
+
+```{r}
+# Residual Diagnostics
+resid <- fit$residuals
+
+# Residuals over time
+plot(resid, type = "l",
+     main = "Residuals Over Time",
+     ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red", lty = 2)
+
+# Histogram with density curve
+hist(resid, breaks = 20, probability = TRUE,
+     main = "Histogram of Residuals",
+     xlab = "Residuals", col = "gray")
+lines(density(resid), col = "blue", lwd = 2)
+
+# Q-Q plot
+qqnorm(resid, main = "Q-Q Plot of Residuals")
+qqline(resid, col = "red", lwd = 2)
+
+# ACF of residuals - check for remaining autocorrelation
+acf(resid, lag.max = 20, main = "ACF of Residuals")
+```
+
+```{r}
+# Observed vs predicted scatterplot
+plot(forecasts, y_test,
+     xlab = "Predicted USD", ylab = "Observed USD",
+     main = "ARIMA(3,1,3) Forecast vs Actual")
+abline(0, 1, col = "red")
+
+# Time series plot of actual vs forecast
+plot(test_data$Date, y_test, type = "l", col = "black", lwd = 2,
+     ylim = range(c(forecasts, y_test)),
+     xlab = "Date", ylab = "Gold Price (USD/oz)",
+     main = "ARIMA(3,1,3) Forecast vs Actual")
+lines(test_data$Date, forecasts, col = "red", lwd = 2, lty = 2)
+legend("topleft", legend = c("Actual", "Forecast"),
+       col = c("black", "red"), lty = c(1, 2), bty = "n")
+```
+
+```{r}
+# Full series ggplot with training, actual, and forecast
+plot_df <- data.frame(
+  Date = c(train_data$Date, test_data$Date, test_data$Date),
+  Value = c(y_train, y_test, forecasts),
+  Type = c(rep("Training", nrow(train_data)),
+           rep("Actual", nrow(test_data)),
+           rep("Forecast", nrow(test_data)))
+)
+
+p <- ggplot(plot_df, aes(x = Date, y = Value, color = Type, linetype = Type)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Training" = "blue",
+    "Actual" = "black",
+    "Forecast" = "red"
+  )) +
+  scale_linetype_manual(values = c(
+    "Training" = "solid",
+    "Actual" = "solid",
+    "Forecast" = "solid"
+  )) +
+  labs(
+    title = "Manual ARIMA(3,1,3) - Gold Price (USD)",
+    subtitle = sprintf("RMSE: %.2f | MAE: %.2f | MAPE: %.2f%%", rmse, mae, mape),
+    x = "Date",
+    y = "Gold Price (USD/oz)",
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+print(p)
+ggsave("arima_gold_forecast.png", p, width = 10, height = 5, dpi = 150)
+```
